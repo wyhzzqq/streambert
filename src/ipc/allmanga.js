@@ -6,6 +6,7 @@
 const { ipcMain } = require("electron");
 const https = require("https");
 const http = require("http");
+const crypto = require("crypto");
 
 // ── AllAnime hex cipher (from ani-cli) ────────────────────────────────────────
 
@@ -107,7 +108,63 @@ function decodeAllanimeUrl(encoded) {
   return result.replace(/\\u002F/gi, "/").replace(/\\\|/g, "");
 }
 
-// ── Plain HTTPS GET for clock.json endpoints ──────────────────────────────────
+// ── AllAnime AES-256-CTR decryption (for "tobeparsed" encrypted responses) ────
+// Mirrors ani-cli's decode_tobeparsed: blob is base64, bytes 1-12 are the IV,
+// bytes 13..(len-16) are the ciphertext, key = SHA256("Xot36i3lK3:v1").
+
+const ALLANIME_KEY = crypto
+  .createHash("sha256")
+  .update("Xot36i3lK3:v1")
+  .digest();
+
+function decodeTobeparsed(blob) {
+  try {
+    const buf = Buffer.from(blob, "base64");
+    const iv12 = buf.slice(1, 13); // 12-byte
+    const iv16 = Buffer.concat([iv12, Buffer.from([0, 0, 0, 2])]); // counter 0x00000002
+    const ct = buf.slice(13, buf.length - 16); // strip 13-byte prefix + 16-byte auth tag
+    const decipher = crypto.createDecipheriv("aes-256-ctr", ALLANIME_KEY, iv16);
+    decipher.setAutoPadding(false);
+    const plain = Buffer.concat([
+      decipher.update(ct),
+      decipher.final(),
+    ]).toString("utf8");
+    // Extract sourceUrl / sourceName pairs from the decrypted JSON blob
+    const sources = [];
+    for (const chunk of plain.split(/[{}]/)) {
+      const urlMatch = chunk.match(/"sourceUrl"\s*:\s*"(--[^"]+)"/);
+      const nameMatch = chunk.match(/"sourceName"\s*:\s*"([^"]+)"/);
+      const prioMatch = chunk.match(/"priority"\s*:\s*([0-9.]+)/);
+      if (urlMatch) {
+        sources.push({
+          sourceUrl: urlMatch[1],
+          sourceName: nameMatch ? nameMatch[1] : "",
+          priority: prioMatch ? parseFloat(prioMatch[1]) : 0,
+        });
+      }
+    }
+    return sources;
+  } catch {
+    return [];
+  }
+}
+
+// Parses an episode GQL response body and returns sourceUrls
+function parseEpisodeSourceUrls(body) {
+  // Check for tobeparsed first (encrypted path)
+  const tbMatch = body.match(/"tobeparsed"\s*:\s*"([^"]+)"/);
+  if (tbMatch) {
+    const sources = decodeTobeparsed(tbMatch[1]);
+    if (sources.length) return sources;
+  }
+  // Standard unencrypted path
+  try {
+    const sourceUrls = JSON.parse(body)?.data?.episode?.sourceUrls;
+    return sourceUrls?.length ? sourceUrls : null;
+  } catch {
+    return null;
+  }
+}
 
 function httpsGet(urlStr) {
   return new Promise((resolve, reject) => {
@@ -328,14 +385,10 @@ async function resolveEpisodeFromId(showId, epStr, dubSub) {
       EPISODE_GQL,
     );
     if (!epRes.body) continue;
-    try {
-      const urls = JSON.parse(epRes.body)?.data?.episode?.sourceUrls;
-      if (urls?.length) {
-        sourceUrls = urls;
-        break;
-      }
-    } catch {
-      continue;
+    const urls = parseEpisodeSourceUrls(epRes.body);
+    if (urls?.length) {
+      sourceUrls = urls;
+      break;
     }
   }
   if (!sourceUrls) return null;
@@ -662,23 +715,26 @@ function register() {
           edges[0];
 
         // 6. Get episode sourceUrls
-        const epRes = await allanimeGQL(
-          { showId: anime._id, translationType: dubSub, episodeString: epStr },
-          EPISODE_GQL,
-        );
-        if (!epRes.body) return { ok: false, error: "Empty episode response" };
+        const epCandidates = [epStr];
+        if (!epStr.includes(".")) epCandidates.push(epStr + ".0");
 
-        let epJson;
-        try {
-          epJson = JSON.parse(epRes.body);
-        } catch {
-          return {
-            ok: false,
-            error: "Episode parse error: " + epRes.body.slice(0, 200),
-          };
+        let sourceUrls = null;
+        for (const attempt of epCandidates) {
+          const epRes = await allanimeGQL(
+            {
+              showId: anime._id,
+              translationType: dubSub,
+              episodeString: attempt,
+            },
+            EPISODE_GQL,
+          );
+          if (!epRes.body) continue;
+          const urls = parseEpisodeSourceUrls(epRes.body);
+          if (urls?.length) {
+            sourceUrls = urls;
+            break;
+          }
         }
-
-        const sourceUrls = epJson?.data?.episode?.sourceUrls;
         if (!sourceUrls?.length)
           return { ok: false, error: "No sourceUrls for ep " + epStr };
 
@@ -713,8 +769,9 @@ function register() {
         try {
           parsed = JSON.parse(r.body);
         } catch {}
-        if (parsed?.data?.episode?.sourceUrls) {
-          parsed._decoded = parsed.data.episode.sourceUrls
+        const decodedUrls = parseEpisodeSourceUrls(r.body);
+        if (decodedUrls?.length) {
+          parsed._decoded = decodedUrls
             .filter((s) => s.sourceUrl?.startsWith("--"))
             .map((s) => {
               const p = decodeAllanimeUrl(s.sourceUrl).replace(
