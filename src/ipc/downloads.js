@@ -290,7 +290,21 @@ function register(getMainWindow) {
           downloadPath,
         ];
 
-        const proc = spawn(binaryPath, args, {
+        // Validate downloader binary path
+        const resolvedPath = path.resolve(binaryPath);
+        const folderPath = path.dirname(resolvedPath);
+        let isPathValid = false;
+        try {
+          if (fs.existsSync(path.join(folderPath, "_internal"))) {
+            isPathValid = true;
+          }
+        } catch {}
+
+        if (!isPathValid) {
+          return { ok: false, error: "Unauthorized downloader binary path" };
+        }
+
+        const proc = spawn(resolvedPath, args, {
           stdio: ["ignore", "pipe", "pipe"],
         });
         activeProcs.set(id, proc);
